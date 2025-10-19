@@ -1,1 +1,3 @@
-./datasets
+./datasets/
+./datasets/*.json
+.DS_Store
