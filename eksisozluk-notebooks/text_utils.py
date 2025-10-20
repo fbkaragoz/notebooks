@@ -6,7 +6,8 @@ Provides clean, reusable functions for tokenization and text cleaning.
 import re
 from typing import List, Set, Optional
 from itertools import chain
-
+import pandas as pd
+from collections import Counter
 
 def clean_text(text: str) -> str:
     """
@@ -116,79 +117,101 @@ def get_turkish_stopwords(include_domain_stopwords: bool = True) -> Set[str]:
 
     return stopwords
 
-
-def tokenize(text: str, stopwords: Optional[Set[str]] = None, min_length: int = 2) -> List[str]:
+def tokenize(text: str, min_length: int = 2, stopwords: Optional[Set[str]] = None) -> List[str]:
     """
-    Tokenize text with stopword removal and length filtering.
-    Uses regex pattern to extract Turkish words (including possessives with apostrophes).
-
+    Tokenize Turkish text with improved suffix handling.
+    
     Args:
-        text: Input text string
-        stopwords: Set of stopwords to remove (defaults to Turkish stopwords)
+        text: Input text to tokenize
         min_length: Minimum token length to keep
-
+        stopwords: Optional set of stopwords to filter out
+        
     Returns:
-        List of filtered tokens
+        List of tokens with normalized suffixes
     """
+    if not isinstance(text, str):
+        return []
+    
     if stopwords is None:
         stopwords = get_turkish_stopwords()
-
-    # Pattern to match Turkish words (with optional apostrophe for possessives)
-    TOKEN_PATTERN = re.compile(r"[a-zğüşöçıîâû]+(?:'[a-zğüşöçıîâû]+)?", flags=re.IGNORECASE)
-
-    cleaned = clean_text(text)
-    tokens = TOKEN_PATTERN.findall(cleaned)
-
-    # Filter stopwords and short tokens
-    tokens = [
-        tok for tok in tokens
-        if tok not in stopwords and len(tok) >= min_length
+    
+    # First clean the text using existing clean_text function
+    text = clean_text(text)
+    
+    # Handle Turkish suffixes with comprehensive patterns
+    suffix_patterns = [
+        # Yönelme hali (dative case)
+        (r"(\w+)'[yY][EeAa]\b", r"\1"),
+        # Belirtme hali (accusative case)
+        (r"(\w+)'[yY][IiİıUuÜü]\b", r"\1"),
+        # Bulunma hali (locative case)
+        (r"(\w+)'[DdTt][EeAa]\b", r"\1"),
+        # Ayrılma hali (ablative case)
+        (r"(\w+)'[DdTt][EeAa][Nn]\b", r"\1"),
+        # İlgi hali (genitive case)
+        (r"(\w+)'[Nn][IiİıUuÜü][Nn]\b", r"\1"),
+        # İle hali (instrumental case)
+        (r"(\w+)'[Ll][EeAa]\b", r"\1"),
+        # Çoğul eki (plural suffix)
+        (r"(\w+)'[Ll][EeAa][Rr]\b", r"\1"),
+        # Kişi ekleri (possessive suffixes)
+        (r"(\w+)'[IiİıUuÜü][Mm]\b", r"\1"),
+        (r"(\w+)'[Ss][IiİıUuÜü][Nn]\b", r"\1"),
     ]
-
-    return tokens
+    
+    # Apply all suffix patterns
+    for pattern, repl in suffix_patterns:
+        text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
+    
+    # Extract tokens with Turkish character support
+    tokens = re.findall(r"[a-zğüşöçıîâû]+", text.lower())
+    
+    # Filter tokens
+    filtered_tokens = [
+        token for token in tokens
+        if len(token) >= min_length
+        and token not in stopwords
+    ]
+    
+    return filtered_tokens
 
 
 def extract_country_terms(topic_titles) -> Set[str]:
     """
-    Extract complete country names from topic titles for filtering.
-    Only extracts FULL country names, not fragments from multi-word names.
-
-    For example:
-    - "el salvador" → adds only "salvador" (not "el" which is too common)
-    - "güney kore" → adds only "kore" (not "güney" which means "south")
-    - "fransa" → adds "fransa"
-
+    Extract significant terms from topic titles.
+    Uses frequency and length-based filtering.
+    
     Args:
-        topic_titles: Iterable of topic titles (country names) - can be list, array, or Series
-
+        topic_titles: Iterable of titles
+        
     Returns:
-        Set of country terms to filter (single-word countries and significant parts of multi-word names)
+        Set of significant terms
     """
-    # Convert to list if it's a numpy array or pandas Series
     if hasattr(topic_titles, 'tolist'):
         topic_titles = topic_titles.tolist()
-
-    country_terms = set()
-
-    # Words that are directional/descriptive and shouldn't be filtered alone
-    # These are common words that appear in multi-word country names
-    directional_words = {'el', 'güney', 'kuzey', 'yeni', 'suudi', 'gürcü', 'bosna'}
-
+    
+    terms = set()
+    word_counts = Counter()
+    
+    # First pass: count all words
     for title in topic_titles:
-        normalized_title = title.lower().strip()
-        # Extract individual words from the title
-        words = re.findall(r"[a-zğüşöçıîâû]+", normalized_title)
-
+        words = re.findall(r"[a-zğüşöçıîâû]+", title.lower())
+        word_counts.update(words)
+    
+    # Second pass: add significant terms
+    for title in topic_titles:
+        words = re.findall(r"[a-zğüşöçıîâû]+", title.lower())
+        
         if len(words) == 1:
-            # Single-word country: add it
-            country_terms.add(words[0])
+            # Single word title: add if long enough
+            if len(words[0]) > 3:
+                terms.add(words[0])
         else:
-            # Multi-word country: only add the significant (non-directional) parts
-            for word in words:
-                if word not in directional_words:
-                    country_terms.add(word)
-
-    return country_terms
+            # Multi-word title: add frequent enough words
+            terms.update(w for w in words 
+                        if word_counts[w] >= 2 and len(w) > 3)
+    
+    return terms
 
 
 def aggregate_tokens_by_group(df, group_col: str, token_col: str = 'tokens') -> dict:
