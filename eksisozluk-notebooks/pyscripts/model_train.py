@@ -7,6 +7,7 @@ from typing import cast
 
 import numpy as np
 import pandas as pd
+from gensim.models import FastText
 
 
 def preview_database(db_path: str | None, table_names: Iterable[str] | None = None) -> None:
@@ -471,6 +472,267 @@ def analyze_topic_trends(
     trend_counts = counts_stats.sort_values(["period", "topic_bucket"]).reset_index(drop=True)
     return trend_counts
 
+# === From Word to Classfier === #
+
+"""The overall workflow will be as follows:
+1. Convert the sentences into tokens
+2. Train a FastText model on the tokens
+3. Convert the vectors into a format suitable for classification
+4. Train a classifier on the vectors"""
+
+def prepare_sentences(entries_df: pd.DataFrame) -> list[list[str]]:
+    """
+    Convert the text_clean column into a list of tokenized sentences for training.
+
+    Args:
+        entries_df: DataFrame containing the text_clean column
+
+    Returns:
+        List of tokenized sentences (list of token lists)
+    """
+    try:
+        from .text_utils import tokenize
+    except ImportError:
+        # Fallback for direct script execution
+        import sys
+        from pathlib import Path
+        script_dir = Path(__file__).parent
+        sys.path.insert(0, str(script_dir))
+        from text_utils import tokenize
+
+    # Tokenize each entry
+    tokenized_sentences = [tokenize(text) for text in entries_df['text_clean'].tolist()]
+    # Filter out empty token lists
+    tokenized_sentences = [sent for sent in tokenized_sentences if sent]
+    return tokenized_sentences
+
+
+def train_fasttext_model(
+    sentences: list[list[str]],
+    vector_size: int = 150,
+    window: int = 5,
+    min_count: int = 5,
+    workers: int = 4,
+    sg: int = 1,
+    epochs: int = 10,
+) -> FastText:
+    """
+    Train a FastText model on tokenized sentences using Gensim.
+
+    Args:
+        sentences: List of tokenized sentences (each sentence is a list of tokens)
+        vector_size: Dimensionality of word vectors
+        window: Maximum distance between current and predicted word
+        min_count: Minimum word frequency threshold
+        workers: Number of worker threads
+        sg: Training algorithm (1 for skip-gram, 0 for CBOW)
+        epochs: Number of training epochs
+
+    Returns:
+        Trained FastText model
+    """
+    try:
+        from gensim.models import FastText
+    except ImportError as exc:
+        raise ImportError("gensim is required for FastText training. Install it with: pip install gensim") from exc
+
+    print(f"Training FastText model on {len(sentences):,} sentences...")
+    print(f"Parameters: vector_size={vector_size}, window={window}, min_count={min_count}, epochs={epochs}")
+
+    model = FastText(
+        sentences=sentences,
+        vector_size=vector_size,
+        window=window,
+        min_count=min_count,
+        workers=workers,
+        sg=sg,
+        epochs=epochs,
+    )
+
+    print(f"Model trained. Vocabulary size: {len(model.wv):,}")
+    return model
+
+
+def create_document_vectors(
+    entries_df: pd.DataFrame,
+    fasttext_model: FastText,
+    tokenized_sentences: list[list[str]] | None = None,
+) -> np.ndarray:
+    """
+    Create document vectors by averaging word vectors from the FastText model.
+
+    Args:
+        entries_df: DataFrame containing the text_clean column
+        fasttext_model: Trained FastText model
+        tokenized_sentences: Pre-tokenized sentences (optional, will tokenize if not provided)
+
+    Returns:
+        Numpy array of document vectors (n_documents, vector_size)
+    """
+    try:
+        from .text_utils import tokenize
+    except ImportError:
+        import sys
+        from pathlib import Path
+        script_dir = Path(__file__).parent
+        sys.path.insert(0, str(script_dir))
+        from text_utils import tokenize
+
+    if tokenized_sentences is None:
+        tokenized_sentences = [tokenize(text) for text in entries_df['text_clean'].tolist()]
+
+    print(f"Creating document vectors for {len(tokenized_sentences):,} documents...")
+
+    document_vectors = []
+    for tokens in tokenized_sentences:
+        if not tokens:
+            # If no tokens, create zero vector
+            document_vectors.append(np.zeros(fasttext_model.vector_size))
+        else:
+            # Average word vectors for all tokens in the document
+            word_vectors = [fasttext_model.wv[token] for token in tokens if token in fasttext_model.wv]
+            if word_vectors:
+                doc_vector = np.mean(word_vectors, axis=0)
+            else:
+                # If no tokens are in vocabulary, create zero vector
+                doc_vector = np.zeros(fasttext_model.vector_size)
+            document_vectors.append(doc_vector)
+
+    document_vectors_array = np.array(document_vectors)
+    print(f"Document vectors created. Shape: {document_vectors_array.shape}")
+    return document_vectors_array
+
+
+def train_fasttext_classifier(
+    df: pd.DataFrame,
+    top_k: int = 20,
+    vector_size: int = 150,
+    test_size: float = 0.2,
+    random_state: int = 42,
+) -> None:
+    """
+    Train a classifier on FastText document vectors to predict topic categories.
+
+    This function:
+    1. Prepares and tokenizes sentences
+    2. Trains a FastText word embedding model
+    3. Creates document vectors by averaging word vectors
+    4. Trains a Logistic Regression classifier on the document vectors
+
+    Args:
+        df: DataFrame containing text_clean and topic_title columns
+        top_k: Number of top topics to classify (rest become "OTHER")
+        vector_size: Dimensionality of FastText word vectors
+        test_size: Proportion of data to use for testing
+        random_state: Random seed for reproducibility
+    """
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import classification_report, f1_score
+        from sklearn.model_selection import train_test_split
+        from sklearn.preprocessing import LabelEncoder
+    except ImportError as exc:
+        print(f"Skipping FastText classifier (scikit-learn missing): {exc}")
+        return
+
+    # Step 1: Prepare data
+    dataset = df.dropna(subset=["topic_title", "text_clean"]).copy()
+    if dataset.empty:
+        print("FastText classifier skipped: no rows with topic_title and text_clean.")
+        return
+
+    dataset = prepare_topic_labels(dataset, top_k=top_k)
+    # Reset index to ensure we can track which rows have valid tokens
+    dataset = dataset.reset_index(drop=True)
+
+    print(f"\n=== FastText Topic Classification ===")
+    print(f"Dataset size: {len(dataset):,} entries")
+    print(f"Number of classes: {dataset['topic_bucket'].nunique()}")
+
+    # Step 2: Tokenize sentences and track valid indices
+    try:
+        from .text_utils import tokenize
+    except ImportError:
+        import sys
+        from pathlib import Path
+        script_dir = Path(__file__).parent
+        sys.path.insert(0, str(script_dir))
+        from text_utils import tokenize
+
+    # Tokenize and keep track of which entries have valid tokens
+    tokenized_data = []
+    valid_indices = []
+    for idx, text in enumerate(dataset['text_clean'].tolist()):
+        tokens = tokenize(text)
+        if tokens:  # Only keep entries with non-empty tokens
+            tokenized_data.append(tokens)
+            valid_indices.append(idx)
+
+    # Filter dataset to only include entries with valid tokens
+    dataset = dataset.iloc[valid_indices].reset_index(drop=True)
+    tokenized_sentences = tokenized_data
+
+    print(f"Tokenized {len(tokenized_sentences):,} sentences (filtered {len(df) - len(tokenized_sentences):,} empty entries)")
+
+    # Step 3: Train FastText model
+    fasttext_model = train_fasttext_model(
+        sentences=tokenized_sentences,
+        vector_size=vector_size,
+    )
+
+    # Step 4: Create document vectors (now dataset and tokenized_sentences are aligned)
+    print(f"Creating document vectors for {len(tokenized_sentences):,} documents...")
+    document_vectors = []
+    for tokens in tokenized_sentences:
+        # Average word vectors for all tokens in the document
+        word_vectors = [fasttext_model.wv[token] for token in tokens if token in fasttext_model.wv]
+        if word_vectors:
+            doc_vector = np.mean(word_vectors, axis=0)
+        else:
+            # If no tokens are in vocabulary, create zero vector
+            doc_vector = np.zeros(fasttext_model.vector_size)
+        document_vectors.append(doc_vector)
+
+    document_vectors = np.array(document_vectors)
+    print(f"Document vectors created. Shape: {document_vectors.shape}")
+
+    # Step 5: Prepare labels
+    label_encoder = LabelEncoder()
+    y = label_encoder.fit_transform(dataset['topic_bucket'])
+
+    # Step 6: Split data
+    X_train, X_test, y_train, y_test = train_test_split(
+        document_vectors,
+        y,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=y,
+    )
+
+    print(f"\nTrain size: {len(X_train):,}, Test size: {len(X_test):,}")
+
+    # Step 7: Train classifier
+    print("Training Logistic Regression classifier...")
+    classifier = LogisticRegression(
+        max_iter=500,
+        class_weight="balanced",
+        solver="lbfgs",
+        random_state=random_state,
+    )
+    classifier.fit(X_train, y_train)
+
+    # Step 8: Evaluate
+    y_pred = classifier.predict(X_test)
+    y_pred_labels = label_encoder.inverse_transform(y_pred)
+    y_test_labels = label_encoder.inverse_transform(y_test)
+
+    micro_f1 = f1_score(y_test, y_pred, average="micro")
+    macro_f1 = f1_score(y_test, y_pred, average="macro")
+
+    print(f"\nMicro F1: {micro_f1:.3f} | Macro F1: {macro_f1:.3f}")
+    print("\nDetailed classification report:")
+    print(classification_report(y_test_labels, y_pred_labels, digits=3))
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="EDA and baseline modeling utilities for eksisozluk crawl.")
@@ -510,6 +772,17 @@ def parse_args() -> argparse.Namespace:
         help="Aggregate topic counts over time and flag spikes.",
     )
     parser.add_argument(
+        "--run-fasttext-classifier",
+        action="store_true",
+        help="Train a FastText + Logistic Regression model to classify entries into top-k topics.",
+    )
+    parser.add_argument(
+        "--fasttext-vector-size",
+        type=int,
+        default=150,
+        help="Dimensionality of FastText word vectors.",
+    )
+    parser.add_argument(
         "--preview-only",
         action="store_true",
         help="Show table schemas/sample rows instead of loading the joined entries dataset.",
@@ -541,6 +814,13 @@ def main() -> None:
 
     if args.run_trend_analysis:
         analyze_topic_trends(df, top_k=args.topic_top_k)
+
+    if args.run_fasttext_classifier:
+        train_fasttext_classifier(
+            df,
+            top_k=args.topic_top_k,
+            vector_size=args.fasttext_vector_size,
+        )
 
 
 if __name__ == "__main__":
