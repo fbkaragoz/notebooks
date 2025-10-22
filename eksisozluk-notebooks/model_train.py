@@ -308,13 +308,24 @@ def run_topic_clustering(
     Run UMAP + HDBSCAN clustering on a TF-IDF representation and print cluster samples.
     """
     try:
-        import hdbscan
-        import umap
-        from sklearn.feature_extraction.text import TfidfVectorizer
-    except ImportError as exc:
-        print(f"Skipping clustering (missing dependency): {exc}")
-        print("Install umap-learn and hdbscan to enable clustering.")
-        return
+        from cuml.cluster.hdbscan import HDBSCAN as CuHDBSCAN
+        from cuml.feature_extraction.text import TfidfVectorizer as CuTfidfVectorizer
+        from cuml.manifold import UMAP as CuUMAP
+        import cupy as cp
+
+        use_gpu = True
+    except ImportError:
+        use_gpu = False
+
+    if not use_gpu:
+        try:
+            import hdbscan
+            import umap
+            from sklearn.feature_extraction.text import TfidfVectorizer
+        except ImportError as exc:
+            print(f"Skipping clustering (missing dependency): {exc}")
+            print("Install umap-learn and hdbscan to enable clustering.")
+            return
 
     corpus = df.dropna(subset=["text_clean"]).copy()
     if corpus.empty:
@@ -325,34 +336,64 @@ def run_topic_clustering(
         corpus = corpus.sample(sample_size, random_state=42)
         print(f"Sampling {len(corpus):,} rows for clustering.")
 
-    vectorizer = TfidfVectorizer(
-        analyzer="word",
-        ngram_range=(1, 2),
-        min_df=5,
-        max_features=40_000,
-        sublinear_tf=True,
-    )
-    tfidf = vectorizer.fit_transform(corpus["text_clean"])
+    if use_gpu:
+        print("Running clustering with GPU acceleration (cuML).")
+        vectorizer = CuTfidfVectorizer(
+            analyzer="word",
+            ngram_range=(1, 2),
+            min_df=5,
+            max_features=40_000,
+            sublinear_tf=True,
+        )
+        tfidf = vectorizer.fit_transform(corpus["text_clean"])
 
-    reducer = umap.UMAP(
-        n_neighbors=30,
-        min_dist=0.0,
-        n_components=10,
-        metric="cosine",
-        random_state=42,
-    )
-    embeddings = reducer.fit_transform(tfidf)
-    if isinstance(embeddings, tuple):
-        embeddings = embeddings[0]
-    embeddings = np.asarray(embeddings)
+        reducer = CuUMAP(
+            n_neighbors=30,
+            min_dist=0.0,
+            n_components=10,
+            metric="cosine",
+            random_state=42,
+        )
+        embeddings_gpu = reducer.fit_transform(tfidf)
+        embeddings = cp.asnumpy(embeddings_gpu)
 
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-        metric="euclidean",
-        cluster_selection_method="eom",
-    )
-    labels = clusterer.fit_predict(embeddings)
+        clusterer = CuHDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            metric="euclidean",
+            cluster_selection_method="eom",
+        )
+        labels_gpu = clusterer.fit_predict(embeddings_gpu)
+        labels = cp.asnumpy(labels_gpu)
+    else:
+        vectorizer = TfidfVectorizer(
+            analyzer="word",
+            ngram_range=(1, 2),
+            min_df=5,
+            max_features=40_000,
+            sublinear_tf=True,
+        )
+        tfidf = vectorizer.fit_transform(corpus["text_clean"])
+
+        reducer = umap.UMAP(
+            n_neighbors=30,
+            min_dist=0.0,
+            n_components=10,
+            metric="cosine",
+            random_state=42,
+        )
+        embeddings = reducer.fit_transform(tfidf)
+        if isinstance(embeddings, tuple):
+            embeddings = embeddings[0]
+        embeddings = np.asarray(embeddings)
+
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            metric="euclidean",
+            cluster_selection_method="eom",
+        )
+        labels = clusterer.fit_predict(embeddings)
 
     corpus = corpus.assign(cluster=labels)
     clustered = corpus[corpus["cluster"] >= 0]

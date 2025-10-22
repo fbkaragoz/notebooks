@@ -5,7 +5,7 @@ Provides efficient text analysis for large-scale document collections.
 
 import pandas as pd
 import numpy as np
-from typing import List, Set, Optional, Tuple
+from typing import Set, Optional, Tuple
 from sklearn.feature_extraction.text import TfidfVectorizer
 from time import time
 
